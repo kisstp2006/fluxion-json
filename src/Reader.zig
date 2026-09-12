@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! JSON one token at a time, from text or from a `Value` already in memory,
-//! with the same calls either way.
+//! JSON one token at a time, from text, from CBOR, or from a `Value` already
+//! in memory, with the same calls every way.
 //!
 //! ```zig
 //! var reader: json.Reader = .init(gpa, text, .{});
@@ -22,8 +22,19 @@ const number = @import("number.zig");
 const Number = number.Number;
 const utf8 = @import("utf8.zig");
 const Value = @import("value.zig").Value;
+const cbor = @import("cbor.zig");
 
 const Reader = @This();
+
+/// What the bytes are.
+pub const Format = enum {
+    /// JSON text, in the syntax `syntax` names.
+    json,
+    /// CBOR (RFC 8949): the same values in binary. Maps with text keys are
+    /// objects, byte strings are base64url text as RFC 8949 converts them,
+    /// and tags are passed over to what they tag.
+    cbor,
+};
 
 pub const Syntax = enum {
     /// RFC 8259 and nothing more: what every other program accepts.
@@ -39,6 +50,10 @@ pub const Syntax = enum {
 
 pub const Options = struct {
     syntax: Syntax = .json,
+    /// JSON text or CBOR. Null tells them apart by the CBOR self-described
+    /// tag, which the `Writer` puts at the start of all it writes as CBOR;
+    /// CBOR from elsewhere, without one, has to be named.
+    format: ?Format = null,
     /// Nesting deeper than this is refused with `error.TooDeep` instead of
     /// being followed. At most `max_depth_limit`.
     max_depth: u16 = 512,
@@ -46,6 +61,10 @@ pub const Options = struct {
 };
 
 pub const max_depth_limit = 1024;
+
+/// What reading CBOR keeps for its open maps and arrays, at the deepest
+/// nesting there can be: room enough for a fixed buffer to read with.
+pub const CborFrames = [max_depth_limit]Cbor.Frame;
 
 pub const Token = union(enum) {
     object_begin,
@@ -74,6 +93,8 @@ max_depth: u16,
 depth: u16 = 0,
 peeked: Peeked = .none,
 tree: ?Tree = null,
+/// Set when the input is CBOR.
+binary: ?Cbor = null,
 
 input: []const u8 = "",
 pos: usize = 0,
@@ -88,10 +109,19 @@ const State = enum { start, value, item, item_or_end, key, key_or_end, colon, co
 const Scan = enum { decode, skip };
 const Peeked = union(enum) { none, token: Token, end };
 
-/// Read `input`. `gpa` holds strings whose escapes had to be decoded, and
-/// nothing else.
+/// Read `input`. `gpa` holds strings whose escapes had to be decoded - and
+/// for CBOR, what each open map and array has left in it - and nothing else.
 pub fn init(gpa: Allocator, input: []const u8, options: Options) Reader {
     const bom = "\xEF\xBB\xBF";
+    const is_cbor = options.format == .cbor or
+        (options.format == null and std.mem.startsWith(u8, input, &cbor.self_described));
+    if (is_cbor) return .{
+        .gpa = gpa,
+        .diagnostics = options.diagnostics,
+        .max_depth = @min(options.max_depth, max_depth_limit),
+        .input = input,
+        .binary = .{},
+    };
     return .{
         .gpa = gpa,
         .diagnostics = options.diagnostics,
@@ -116,6 +146,10 @@ pub fn initValue(gpa: Allocator, value: Value, options: Options) Reader {
 pub fn deinit(r: *Reader) void {
     r.scratch.deinit(r.gpa);
     if (r.tree) |*t| t.stack.deinit(r.gpa);
+    if (r.binary) |*c| {
+        c.stack.deinit(r.gpa);
+        c.base64.deinit(r.gpa);
+    }
     r.* = undefined;
 }
 
@@ -134,7 +168,7 @@ pub fn peek(r: *Reader) Error!?Kind {
         .end => return null,
         .none => {},
     }
-    if (r.tree == null) return r.peekText();
+    if (r.tree == null and r.binary == null) return r.peekText();
     if (try r.advance(.decode)) |token| {
         r.peeked = .{ .token = token };
         return token;
@@ -160,9 +194,10 @@ pub fn skipValue(r: *Reader) Error!void {
     }
 }
 
-/// Line and column of the last token. Zero for a reader walking a `Value`.
+/// Line and column of the last token. Zero for a reader walking a `Value`,
+/// and for CBOR, which has no lines: there `token_start` is the byte.
 pub fn location(r: *const Reader) Location {
-    if (r.tree != null) return .{ .line = 0, .column = 0 };
+    if (r.tree != null or r.binary != null) return .{ .line = 0, .column = 0 };
     return Diagnostics.locate(r.input, r.token_start);
 }
 
@@ -175,9 +210,19 @@ pub fn report(r: *Reader, comptime fmt: []const u8, args: anytype) void {
 /// Describe a problem at `offset` in the text.
 pub fn reportAt(r: *Reader, offset: usize, comptime fmt: []const u8, args: anytype) void {
     const d = r.diagnostics orelse return;
-    if (r.tree == null) d.setPlace(r.input, offset) else d.setNoPlace();
+    r.place(d, offset);
     d.setMessage(fmt, args);
     d.path_len = 0;
+}
+
+/// Point `d` at `offset`: a line and a column in text, a byte in CBOR, and
+/// nowhere in a tree.
+fn place(r: *const Reader, d: *Diagnostics, offset: usize) void {
+    if (r.binary != null) {
+        d.setByte(offset);
+    } else if (r.tree == null) {
+        d.setPlace(r.input, offset);
+    } else d.setNoPlace();
 }
 
 fn advance(r: *Reader, comptime scan: Scan) Error!?Token {
@@ -189,6 +234,7 @@ fn advance(r: *Reader, comptime scan: Scan) Error!?Token {
         .end => return null,
         .none => {},
     }
+    if (r.binary != null) return r.cborNext(scan);
     if (r.tree != null) return r.treeNext();
     return r.textNext(scan);
 }
@@ -770,7 +816,7 @@ fn isWordPart(c: u8) bool {
 noinline fn fail(r: *Reader, at: usize, comptime fmt: []const u8, args: anytype) error{SyntaxError} {
     @branchHint(.cold);
     if (r.diagnostics) |d| {
-        d.setPlace(r.input, at);
+        r.place(d, at);
         d.setMessage(fmt, args);
         d.path_len = 0;
     }
@@ -779,7 +825,7 @@ noinline fn fail(r: *Reader, at: usize, comptime fmt: []const u8, args: anytype)
 
 fn tooDeep(r: *Reader) error{TooDeep} {
     if (r.diagnostics) |d| {
-        if (r.tree == null) d.setPlace(r.input, r.pos) else d.setNoPlace();
+        r.place(d, if (r.binary != null) r.token_start else r.pos);
         d.setMessage("nested deeper than {d} levels", .{r.max_depth});
         d.path_len = 0;
     }
@@ -931,8 +977,248 @@ fn floatText(buf: *[number.max_float_len]u8, f: f64) []const u8 {
     return number.formatFloat(buf, f);
 }
 
+// -------------------------------------------------------------------------
+// CBOR
+// -------------------------------------------------------------------------
+//
+// Items become the tokens the same text would. Numbers are written out as
+// text, as a tree's are: an integer exactly, and a float in the fewest digits
+// that read back as the value it holds, whatever width it was written in.
+
+const Cbor = struct {
+    stack: std.ArrayListUnmanaged(Frame) = .empty,
+    /// Where a byte string's base64 goes: its bytes may be in `scratch`.
+    base64: std.ArrayListUnmanaged(u8) = .empty,
+    number_buf: [number.max_float_len]u8 = undefined,
+    done: bool = false,
+
+    /// A map or an array still open.
+    const Frame = struct {
+        /// What is left of one of known length: items, or for a map, pairs.
+        remaining: u64,
+        opened_at: usize,
+        is_object: bool,
+        indefinite: bool,
+        want_key: bool,
+    };
+};
+
+fn cborNext(r: *Reader, comptime scan: Scan) Error!?Token {
+    const c = &r.binary.?;
+    if (c.done) {
+        if (r.pos < r.input.len) return r.fail(r.pos, "unexpected byte 0x{X:0>2} after the end of the CBOR value", .{r.input[r.pos]});
+        return null;
+    }
+    if (c.stack.items.len > 0) {
+        const top = &c.stack.items[c.stack.items.len - 1];
+        if (top.indefinite) {
+            if (r.pos < r.input.len and r.input[r.pos] == cbor.break_byte) {
+                if (top.is_object and !top.want_key) return r.fail(r.pos, "this map ends between a key and its value", .{});
+                r.token_start = r.pos;
+                r.pos += 1;
+                return r.cborClose();
+            }
+        } else if (top.remaining == 0) {
+            r.token_start = r.pos;
+            return r.cborClose();
+        }
+        if (top.is_object and top.want_key) return try r.cborKey(scan);
+    }
+    return try r.cborValue(scan);
+}
+
+fn cborClose(r: *Reader) Token {
+    const frame = r.binary.?.stack.pop().?;
+    r.depth -= 1;
+    r.cborDone();
+    return if (frame.is_object) .object_end else .array_end;
+}
+
+/// A value is complete: the map or the array it is in moves on, or the
+/// document is over.
+fn cborDone(r: *Reader) void {
+    const c = &r.binary.?;
+    if (c.stack.items.len == 0) {
+        c.done = true;
+        return;
+    }
+    const top = &c.stack.items[c.stack.items.len - 1];
+    if (top.is_object) top.want_key = true;
+    if (!top.indefinite) top.remaining -= 1;
+}
+
+fn cborKey(r: *Reader, comptime scan: Scan) Error!Token {
+    const head = try r.cborHead();
+    if (head.major != .text) return r.fail(r.token_start, "a key must be text for JSON, and this map has {s} as one", .{cborKind(head)});
+    const name = try r.cborBytes(head, .text, scan);
+    const c = &r.binary.?;
+    c.stack.items[c.stack.items.len - 1].want_key = false;
+    return .{ .key = name };
+}
+
+fn cborValue(r: *Reader, comptime scan: Scan) Error!Token {
+    const head = try r.cborHead();
+    const c = &r.binary.?;
+    switch (head.major) {
+        .unsigned, .negative => {
+            if (head.info == cbor.indefinite) return r.fail(r.token_start, "a number cannot be of indefinite length", .{});
+            const text = if (scan == .skip)
+                "0"
+            else if (head.major == .unsigned)
+                number.formatInt(&c.number_buf, head.argument)
+            else
+                number.formatInt(&c.number_buf, -1 - @as(i128, head.argument));
+            r.cborDone();
+            return .{ .number = .{ .text = text } };
+        },
+        .bytes => {
+            const bytes = try r.cborBytes(head, .bytes, scan);
+            const text = if (scan == .skip) "" else try r.base64(bytes);
+            r.cborDone();
+            return .{ .string = text };
+        },
+        .text => {
+            const text = try r.cborBytes(head, .text, scan);
+            r.cborDone();
+            return .{ .string = text };
+        },
+        .array, .map => {
+            const is_object = head.major == .map;
+            if (r.depth >= r.max_depth) return r.tooDeep();
+            // All at once, so the stack never grows piece by piece.
+            if (c.stack.capacity == 0) try c.stack.ensureTotalCapacityPrecise(r.gpa, r.max_depth);
+            c.stack.appendAssumeCapacity(.{
+                .remaining = head.argument,
+                .opened_at = r.token_start,
+                .is_object = is_object,
+                .indefinite = head.info == cbor.indefinite,
+                .want_key = is_object,
+            });
+            r.depth += 1;
+            return if (is_object) .object_begin else .array_begin;
+        },
+        .simple => {
+            const token: Token = switch (head.info) {
+                20 => .{ .bool = false },
+                21 => .{ .bool = true },
+                22, 23 => .null,
+                25, 26, 27 => .{ .number = .{ .text = floatText(&c.number_buf, cbor.floatValue(head)) } },
+                cbor.indefinite => {
+                    if (c.stack.items.len == 0) return r.fail(r.token_start, "a break (0xFF) with nothing open for it to close", .{});
+                    const container = if (c.stack.items[c.stack.items.len - 1].is_object) "a map" else "an array";
+                    return r.fail(r.token_start, "a break (0xFF) in {s} of known length, which ends without one", .{container});
+                },
+                else => return r.fail(r.token_start, "simple value {d} has no JSON form", .{head.argument}),
+            };
+            r.cborDone();
+            return token;
+        },
+        .tag => unreachable,
+    }
+}
+
+/// The next item's head, past any tags on it: JSON has no tags, so what they
+/// tag is read as it is.
+fn cborHead(r: *Reader) Error!cbor.Head {
+    while (true) {
+        r.token_start = r.pos;
+        const head = try r.cborReadHead();
+        if (head.major != .tag) return head;
+        if (head.info == cbor.indefinite) return r.fail(r.token_start, "a tag cannot be of indefinite length", .{});
+        if (head.argument == 2 or head.argument == 3)
+            return r.fail(r.token_start, "a big number (tag {d}) has no JSON form here", .{head.argument});
+    }
+}
+
+fn cborReadHead(r: *Reader) Error!cbor.Head {
+    const head = cbor.readHead(r.input[r.pos..]) catch |err| switch (err) {
+        error.Truncated => return r.cborEnds(),
+        error.Reserved => return r.fail(r.pos, "byte 0x{X:0>2} starts no CBOR item: additional information {d} is reserved", .{ r.input[r.pos], r.input[r.pos] & 0x1F }),
+    };
+    r.pos += head.size;
+    return head;
+}
+
+/// A byte or text string's bytes. One of unknown length is its parts joined,
+/// in `scratch`; each part of text has to be UTF-8 on its own.
+fn cborBytes(r: *Reader, head: cbor.Head, comptime major: cbor.Major, comptime scan: Scan) Error![]const u8 {
+    if (head.info != cbor.indefinite) return r.cborChunk(head.argument, major);
+    if (scan == .decode) r.scratch.clearRetainingCapacity();
+    while (true) {
+        if (r.pos >= r.input.len) return r.cborEnds();
+        if (r.input[r.pos] == cbor.break_byte) {
+            r.pos += 1;
+            return if (scan == .decode) r.scratch.items else "";
+        }
+        const part_at = r.pos;
+        const part = try r.cborReadHead();
+        if (part.major != major or part.info == cbor.indefinite)
+            return r.fail(part_at, "a {s} of unknown length is made of {s}s of known length, and this part is not", .{ cborName(major), cborName(major) });
+        const bytes = try r.cborChunk(part.argument, major);
+        if (scan == .decode) try r.scratch.appendSlice(r.gpa, bytes);
+    }
+}
+
+fn cborChunk(r: *Reader, length: u64, comptime major: cbor.Major) Error![]const u8 {
+    if (length > r.input.len - r.pos) return r.cborEnds();
+    const start = r.pos;
+    const bytes = r.input[start..][0..@intCast(length)];
+    r.pos += bytes.len;
+    if (major == .text) {
+        var i: usize = 0;
+        while (true) {
+            i = utf8.asciiRun(bytes, i);
+            if (i >= bytes.len) break;
+            i += utf8.sequenceLength(bytes[i..]) orelse return r.explainUtf8(start + i);
+        }
+    }
+    return bytes;
+}
+
+/// A byte string as JSON can hold it: base64url text, as RFC 8949 converts it.
+fn base64(r: *Reader, bytes: []const u8) Error![]const u8 {
+    const encoder = std.base64.url_safe_no_pad.Encoder;
+    const out = &r.binary.?.base64;
+    try out.resize(r.gpa, encoder.calcSize(bytes.len));
+    return encoder.encode(out.items, bytes);
+}
+
+fn cborEnds(r: *Reader) error{SyntaxError} {
+    @branchHint(.cold);
+    const c = &r.binary.?;
+    if (c.stack.items.len == 0) return r.fail(r.input.len, "the CBOR ends before its value is complete", .{});
+    const top = c.stack.items[c.stack.items.len - 1];
+    return r.fail(r.input.len, "the CBOR ends before the {s} opened at byte {d} is closed", .{ if (top.is_object) "map" else "array", top.opened_at });
+}
+
+fn cborName(major: cbor.Major) []const u8 {
+    return if (major == .text) "text string" else "byte string";
+}
+
+fn cborKind(head: cbor.Head) []const u8 {
+    return switch (head.major) {
+        .unsigned, .negative => "a number",
+        .bytes => "a byte string",
+        .text => "text",
+        .array => "an array",
+        .map => "a map",
+        .tag => "a tag",
+        .simple => switch (head.info) {
+            20, 21 => "a boolean",
+            22, 23 => "null",
+            25, 26, 27 => "a number",
+            cbor.indefinite => "a break (0xFF)",
+            else => "a simple value",
+        },
+    };
+}
+
 fn expectTokens(syntax: Syntax, text: []const u8, expected: []const Token) !void {
-    var reader: Reader = .init(testing.allocator, text, .{ .syntax = syntax });
+    return expectRead(.{ .syntax = syntax }, text, expected);
+}
+
+fn expectRead(options: Options, input: []const u8, expected: []const Token) !void {
+    var reader: Reader = .init(testing.allocator, input, options);
     defer reader.deinit();
     for (expected) |want| {
         const got = (try reader.next()) orelse return error.TestUnexpectedEnd;
@@ -949,19 +1235,32 @@ fn expectTokens(syntax: Syntax, text: []const u8, expected: []const Token) !void
 }
 
 fn expectFailure(syntax: Syntax, text: []const u8, expected_error: Error, message: []const u8) !void {
+    const diagnostics = try readToError(.{ .syntax = syntax }, text, expected_error);
+    try testing.expectEqualStrings(message, diagnostics.message());
+}
+
+fn expectCborFailure(input: []const u8, message: []const u8, at: usize) !void {
+    const diagnostics = try readToError(.{ .format = .cbor }, input, error.SyntaxError);
+    try testing.expectEqualStrings(message, diagnostics.message());
+    try testing.expect(diagnostics.binary);
+    try testing.expectEqual(at, diagnostics.offset);
+}
+
+/// Read `input` until it fails, which it must, with `expected_error`: what
+/// the diagnostics then say.
+fn readToError(options: Options, input: []const u8, expected_error: Error) !Diagnostics {
     var diagnostics: Diagnostics = .{};
-    var reader: Reader = .init(testing.allocator, text, .{ .syntax = syntax, .diagnostics = &diagnostics });
+    var with_diagnostics = options;
+    with_diagnostics.diagnostics = &diagnostics;
+    var reader: Reader = .init(testing.allocator, input, with_diagnostics);
     defer reader.deinit();
-    var outcome: ?Error = null;
-    while (outcome == null) {
+    while (true) {
         const token = reader.next() catch |err| {
-            outcome = err;
-            break;
+            try testing.expectEqual(expected_error, err);
+            return diagnostics;
         };
         if (token == null) return error.TestExpectedError;
     }
-    try testing.expectEqual(expected_error, outcome.?);
-    try testing.expectEqualStrings(message, diagnostics.message());
 }
 
 test "tokens of a document" {
@@ -1164,4 +1463,79 @@ test "location is the line and column of the last token" {
     defer reader.deinit();
     for (0..4) |_| _ = try reader.next();
     try testing.expectEqual(Location{ .line = 3, .column = 5 }, reader.location());
+}
+
+test "CBOR reads as the tokens the same JSON would" {
+    // {"a": [1, -2, 1.5, "x", h'fbff', true, null], "ab": {"cd": 1}}, the
+    // keys "ab" and "cd" each in two parts and the last map of unknown length.
+    try expectRead(.{}, &cbor.hex("d9d9f7 a2 6161 87 01 21 f93e00 6178 42fbff f5 f6 7f 6161 6162 ff bf 7f 6163 6164 ff 01 ff"), &.{
+        .object_begin,
+        .{ .key = "a" },
+        .array_begin,
+        .{ .number = .{ .text = "1" } },
+        .{ .number = .{ .text = "-2" } },
+        .{ .number = .{ .text = "1.5" } },
+        .{ .string = "x" },
+        .{ .string = "-_8" },
+        .{ .bool = true },
+        .null,
+        .array_end,
+        .{ .key = "ab" },
+        .object_begin,
+        .{ .key = "cd" },
+        .{ .number = .{ .text = "1" } },
+        .object_end,
+        .object_end,
+    });
+}
+
+test "CBOR is told from text by its tag, or read when it is named" {
+    const counted: []const Token = &.{ .array_begin, .{ .number = .{ .text = "1" } }, .{ .number = .{ .text = "2" } }, .array_end };
+    try expectRead(.{}, &cbor.hex("d9d9f7 82 01 02"), counted);
+    try expectRead(.{ .format = .cbor }, &cbor.hex("82 01 02"), counted);
+    _ = try readToError(.{}, &cbor.hex("82 01 02"), error.SyntaxError);
+    _ = try readToError(.{ .format = .json }, &cbor.hex("d9d9f7 82 01 02"), error.SyntaxError);
+}
+
+test "CBOR mistakes say what is wrong, and at which byte" {
+    try expectCborFailure("", "the CBOR ends before its value is complete", 0);
+    try expectCborFailure(&cbor.hex("d9d9f7 82 01"), "the CBOR ends before the array opened at byte 3 is closed", 5);
+    try expectCborFailure(&cbor.hex("a1 6161 63 6263"), "the CBOR ends before the map opened at byte 0 is closed", 6);
+    try expectCborFailure(&cbor.hex("01 02"), "unexpected byte 0x02 after the end of the CBOR value", 1);
+    try expectCborFailure(&cbor.hex("1c"), "byte 0x1C starts no CBOR item: additional information 28 is reserved", 0);
+    try expectCborFailure(&cbor.hex("a1 01 02"), "a key must be text for JSON, and this map has a number as one", 1);
+    try expectCborFailure(&cbor.hex("bf 6161 ff"), "this map ends between a key and its value", 3);
+    try expectCborFailure(&cbor.hex("ff"), "a break (0xFF) with nothing open for it to close", 0);
+    try expectCborFailure(&cbor.hex("82 01 ff"), "a break (0xFF) in an array of known length, which ends without one", 2);
+    try expectCborFailure(&cbor.hex("62 c328"), "this is not UTF-8 text: byte 0xC3 starts a broken character", 1);
+    try expectCborFailure(&cbor.hex("7f 6161 4162 ff"), "a text string of unknown length is made of text strings of known length, and this part is not", 3);
+    try expectCborFailure(&cbor.hex("c2 4101"), "a big number (tag 2) has no JSON form here", 0);
+    try expectCborFailure(&cbor.hex("f0"), "simple value 16 has no JSON form", 0);
+    try expectCborFailure(&cbor.hex("1f"), "a number cannot be of indefinite length", 0);
+    try expectCborFailure(&cbor.hex("df 01"), "a tag cannot be of indefinite length", 0);
+
+    var diagnostics: Diagnostics = .{};
+    var reader: Reader = .init(testing.allocator, &cbor.hex("81 81 81 81 01"), .{ .format = .cbor, .max_depth = 3, .diagnostics = &diagnostics });
+    defer reader.deinit();
+    for (0..3) |_| _ = try reader.next();
+    try testing.expectError(error.TooDeep, reader.next());
+    try testing.expectEqualStrings("nested deeper than 3 levels", diagnostics.message());
+    try testing.expectEqual(@as(usize, 3), diagnostics.offset);
+}
+
+test "peek and skipValue work on CBOR as they do on text" {
+    // {"skip": {"deep": [1, {"x": "\n"}]}, "keep": 7}
+    var reader: Reader = .init(testing.allocator, &cbor.hex("d9d9f7 bf 64736b6970 a1 6464656570 9f 01 a1 6178 610a ff 646b656570 07 ff"), .{});
+    defer reader.deinit();
+    try testing.expectEqual(Kind.object_begin, (try reader.peek()).?);
+    try testing.expectEqual(Kind.object_begin, (try reader.peek()).?);
+    _ = try reader.next();
+    try testing.expectEqualStrings("skip", (try reader.next()).?.key);
+    try testing.expectEqual(Kind.object_begin, (try reader.peek()).?);
+    try reader.skipValue();
+    try testing.expectEqualStrings("keep", (try reader.next()).?.key);
+    try reader.skipValue();
+    try testing.expectEqual(Kind.object_end, std.meta.activeTag((try reader.next()).?));
+    try testing.expectEqual(@as(?Kind, null), try reader.peek());
+    try testing.expectEqual(@as(?Token, null), try reader.next());
 }

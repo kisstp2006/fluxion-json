@@ -23,6 +23,8 @@ line: u32 = 0,
 column: u32 = 0,
 /// Bytes from the start of the text.
 offset: usize = 0,
+/// Whether the place is a byte of CBOR, which has no lines to show.
+binary: bool = false,
 
 message_len: u16 = 0,
 path_len: u16 = 0,
@@ -56,8 +58,13 @@ pub fn sourceLine(d: *const Diagnostics) []const u8 {
 }
 
 pub fn format(d: Diagnostics, w: *std.Io.Writer) std.Io.Writer.Error!void {
-    if (d.file_len > 0) {
-        try w.print("{s}:{d}:{d}: ", .{ d.file(), d.line, d.column });
+    if (d.binary) {
+        if (d.file_len > 0) try w.print("{s}: ", .{d.file()});
+        try w.print("byte {d}: ", .{d.offset});
+    } else if (d.file_len > 0) {
+        if (d.line > 0) {
+            try w.print("{s}:{d}:{d}: ", .{ d.file(), d.line, d.column });
+        } else try w.print("{s}: ", .{d.file()});
     } else if (d.line > 0) {
         try w.print("line {d}, column {d}: ", .{ d.line, d.column });
     }
@@ -99,6 +106,7 @@ pub fn setPlace(d: *Diagnostics, source: []const u8, offset: usize) void {
 
     const place = locate(source, at);
     d.offset = at;
+    d.binary = false;
     d.line = place.line;
     d.column = place.column;
 
@@ -125,8 +133,16 @@ pub fn setNoPlace(d: *Diagnostics) void {
     d.line = 0;
     d.column = 0;
     d.offset = 0;
+    d.binary = false;
     d.snippet_len = 0;
     d.caret = 0;
+}
+
+/// Point at a byte of CBOR.
+pub fn setByte(d: *Diagnostics, offset: usize) void {
+    d.setNoPlace();
+    d.offset = offset;
+    d.binary = true;
 }
 
 pub fn setMessage(d: *Diagnostics, comptime fmt: []const u8, args: anytype) void {
@@ -221,6 +237,28 @@ test "the end of the text is a place too" {
     d.setPlace(source, source.len);
     try testing.expectEqual(@as(u32, 6), d.column);
     try testing.expectEqual(@as(u16, 5), d.caret);
+}
+
+test "a file with no place in it is named without a line" {
+    var d: Diagnostics = .{};
+    d.setFile("missing.json");
+    d.setMessage("cannot read the file: FileNotFound", .{});
+    try expectPrinted("missing.json: cannot read the file: FileNotFound", d);
+}
+
+test "a byte of CBOR is a place too, with no line to show" {
+    var d: Diagnostics = .{};
+    d.setByte(7);
+    d.setMessage("this map ends between a key and its value", .{});
+    try expectPrinted("byte 7: this map ends between a key and its value", d);
+
+    d.setFile("level.cbor");
+    d.setPath("/enemies/3");
+    try expectPrinted("level.cbor: byte 7: this map ends between a key and its value (at /enemies/3)", d);
+
+    d.setPlace("[1, x]", 4);
+    try testing.expect(!d.binary);
+    try testing.expectEqual(@as(u32, 5), d.column);
 }
 
 test "a message too long for its buffer ends in an ellipsis" {

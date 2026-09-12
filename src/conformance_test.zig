@@ -2,14 +2,16 @@
 
 //! A round trip only proves the reader and the writer agree with each other,
 //! so most of this is the other thing: what every JSON reader must take and
-//! must refuse (the cases follow Nicolas Seriot's JSONTestSuite), random
-//! trees written in every layout and read back, text damaged at random, a
-//! cross-check against `std.json`, and every allocation failing in turn.
+//! must refuse (the cases follow Nicolas Seriot's JSONTestSuite), RFC 8949's
+//! own CBOR examples, random trees written in every layout and in CBOR and
+//! read back, text and CBOR damaged at random, a cross-check against
+//! `std.json`, and every allocation failing in turn.
 
 const std = @import("std");
 const testing = std.testing;
 const json = @import("root.zig");
 const Value = json.Value;
+const hex = @import("cbor.zig").hex;
 
 const must_accept = [_][]const u8{
     "[[]   ]",                                 "[\"\"]",                             "[]",                               "[\"a\"]",
@@ -92,6 +94,118 @@ test "what every JSON reader must refuse, this one does, and says where" {
     }
 }
 
+/// RFC 8949's Appendix A, with the JSON each example reads as. Byte strings
+/// become base64url text, whatever a tag on them hints, and tags are passed
+/// over to what they tag.
+const rfc8949_examples = [_]struct { []const u8, []const u8 }{
+    .{ &hex("00"), "0" },
+    .{ &hex("01"), "1" },
+    .{ &hex("0a"), "10" },
+    .{ &hex("17"), "23" },
+    .{ &hex("1818"), "24" },
+    .{ &hex("1819"), "25" },
+    .{ &hex("1864"), "100" },
+    .{ &hex("1903e8"), "1000" },
+    .{ &hex("1a000f4240"), "1000000" },
+    .{ &hex("1b000000e8d4a51000"), "1000000000000" },
+    .{ &hex("1bffffffffffffffff"), "18446744073709551615" },
+    .{ &hex("3bffffffffffffffff"), "-18446744073709551616" },
+    .{ &hex("20"), "-1" },
+    .{ &hex("29"), "-10" },
+    .{ &hex("3863"), "-100" },
+    .{ &hex("3903e7"), "-1000" },
+    .{ &hex("f90000"), "0.0" },
+    .{ &hex("f98000"), "-0.0" },
+    .{ &hex("f93c00"), "1.0" },
+    .{ &hex("fb3ff199999999999a"), "1.1" },
+    .{ &hex("f93e00"), "1.5" },
+    .{ &hex("f97bff"), "65504.0" },
+    .{ &hex("fa47c35000"), "100000.0" },
+    .{ &hex("fa7f7fffff"), "3.4028234663852886e+38" },
+    .{ &hex("fb7e37e43c8800759c"), "1e+300" },
+    .{ &hex("f90001"), "5.960464477539063e-8" },
+    .{ &hex("f90400"), "0.00006103515625" },
+    .{ &hex("f9c400"), "-4.0" },
+    .{ &hex("fbc010666666666666"), "-4.1" },
+    .{ &hex("f97c00"), "Infinity" },
+    .{ &hex("f97e00"), "NaN" },
+    .{ &hex("f9fc00"), "-Infinity" },
+    .{ &hex("fa7f800000"), "Infinity" },
+    .{ &hex("fa7fc00000"), "NaN" },
+    .{ &hex("faff800000"), "-Infinity" },
+    .{ &hex("fb7ff0000000000000"), "Infinity" },
+    .{ &hex("fb7ff8000000000000"), "NaN" },
+    .{ &hex("fbfff0000000000000"), "-Infinity" },
+    .{ &hex("f4"), "false" },
+    .{ &hex("f5"), "true" },
+    .{ &hex("f6"), "null" },
+    .{ &hex("f7"), "null" },
+    .{ &hex("c074323031332d30332d32315432303a30343a30305a"), "\"2013-03-21T20:04:00Z\"" },
+    .{ &hex("c11a514b67b0"), "1363896240" },
+    .{ &hex("c1fb41d452d9ec200000"), "1363896240.5" },
+    .{ &hex("d74401020304"), "\"AQIDBA\"" },
+    .{ &hex("d818456449455446"), "\"ZElFVEY\"" },
+    .{ &hex("d82076687474703a2f2f7777772e6578616d706c652e636f6d"), "\"http://www.example.com\"" },
+    .{ &hex("40"), "\"\"" },
+    .{ &hex("4401020304"), "\"AQIDBA\"" },
+    .{ &hex("60"), "\"\"" },
+    .{ &hex("6161"), "\"a\"" },
+    .{ &hex("6449455446"), "\"IETF\"" },
+    .{ &hex("62225c"), "\"\\\"\\\\\"" },
+    .{ &hex("62c3bc"), "\"ü\"" },
+    .{ &hex("63e6b0b4"), "\"水\"" },
+    .{ &hex("64f0908591"), "\"𐅑\"" },
+    .{ &hex("80"), "[]" },
+    .{ &hex("83010203"), "[1,2,3]" },
+    .{ &hex("8301820203820405"), "[1,[2,3],[4,5]]" },
+    .{ &hex("98190102030405060708090a0b0c0d0e0f101112131415161718181819"), one_to_25 },
+    .{ &hex("a0"), "{}" },
+    .{ &hex("a26161016162820203"), "{\"a\":1,\"b\":[2,3]}" },
+    .{ &hex("826161a161626163"), "[\"a\",{\"b\":\"c\"}]" },
+    .{ &hex("a56161614161626142616361436164614461656145"), "{\"a\":\"A\",\"b\":\"B\",\"c\":\"C\",\"d\":\"D\",\"e\":\"E\"}" },
+    .{ &hex("5f42010243030405ff"), "\"AQIDBAU\"" },
+    .{ &hex("7f657374726561646d696e67ff"), "\"streaming\"" },
+    .{ &hex("9fff"), "[]" },
+    .{ &hex("9f018202039f0405ffff"), "[1,[2,3],[4,5]]" },
+    .{ &hex("9f01820203820405ff"), "[1,[2,3],[4,5]]" },
+    .{ &hex("83018202039f0405ff"), "[1,[2,3],[4,5]]" },
+    .{ &hex("83019f0203ff820405"), "[1,[2,3],[4,5]]" },
+    .{ &hex("9f0102030405060708090a0b0c0d0e0f101112131415161718181819ff"), one_to_25 },
+    .{ &hex("bf61610161629f0203ffff"), "{\"a\":1,\"b\":[2,3]}" },
+    .{ &hex("826161bf61626163ff"), "[\"a\",{\"b\":\"c\"}]" },
+    .{ &hex("bf6346756ef563416d7421ff"), "{\"Fun\":true,\"Amt\":-2}" },
+};
+
+const one_to_25 = "[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25]";
+
+/// The rest of Appendix A: big numbers, maps with numbers for keys, and
+/// simple values with no meaning yet.
+const rfc8949_refused = [_][]const u8{
+    &hex("c249010000000000000000"),
+    &hex("c349010000000000000000"),
+    &hex("a201020304"),
+    &hex("f0"),
+    &hex("f8ff"),
+};
+
+test "RFC 8949's examples read as JSON, or are refused when JSON cannot hold them" {
+    for (rfc8949_examples) |example| {
+        const bytes, const expected = example;
+        errdefer std.debug.print("example {x}\n", .{bytes});
+        const text = try json.reformat(testing.allocator, bytes, .{ .format = .cbor }, .{ .non_finite = .literal });
+        defer testing.allocator.free(text);
+        try testing.expectEqualStrings(expected, text);
+        try testing.expect(json.valid(bytes, .{ .format = .cbor }));
+    }
+    for (rfc8949_refused) |bytes| {
+        errdefer std.debug.print("accepted {x}\n", .{bytes});
+        try testing.expect(!json.valid(bytes, .{ .format = .cbor }));
+        var diagnostics: json.Diagnostics = .{};
+        try testing.expectError(error.SyntaxError, json.parse(testing.allocator, bytes, .{ .format = .cbor, .diagnostics = &diagnostics }));
+        try testing.expect(diagnostics.binary and diagnostics.message().len > 0);
+    }
+}
+
 test "nesting a hundred thousand deep is refused, not followed" {
     const deep = try testing.allocator.alloc(u8, 100_000);
     defer testing.allocator.free(deep);
@@ -99,6 +213,12 @@ test "nesting a hundred thousand deep is refused, not followed" {
     try testing.expect(!json.valid(deep, .{}));
     try testing.expectError(error.TooDeep, json.parse(testing.allocator, deep, .{}));
     try testing.expectError(error.TooDeep, json.parseAs([]const json.Value, testing.allocator, deep, .{}));
+
+    @memset(deep, 0x81);
+    try testing.expect(!json.valid(deep, .{ .format = .cbor }));
+    try testing.expectError(error.TooDeep, json.parse(testing.allocator, deep, .{ .format = .cbor }));
+    deep[1000] = 0x00;
+    try testing.expect(json.valid(deep[0..1001], .{ .format = .cbor, .max_depth = json.Reader.max_depth_limit }));
 }
 
 /// A random tree: scalars of every kind, strings with escapes and characters
@@ -174,6 +294,33 @@ test "random trees read back equal, in every layout" {
             defer testing.allocator.free(compact);
             try testing.expectEqualStrings(compact, again);
         }
+    }
+}
+
+test "random trees read back equal through CBOR, and come out as the same JSON" {
+    var prng = std.Random.DefaultPrng.init(0xCB0);
+    const random = prng.random();
+    for (0..400) |_| {
+        const doc: json.Document = try .init(testing.allocator);
+        defer doc.deinit();
+        const tree = try randomValue(doc, random, 0);
+        const bytes = try json.stringify(testing.allocator, tree, .{ .format = .cbor });
+        defer testing.allocator.free(bytes);
+        try testing.expect(json.valid(bytes, .{}));
+        const back = try json.parse(testing.allocator, bytes, .{});
+        defer back.deinit();
+        try testing.expect(back.root.eql(tree));
+
+        // Every number the kind it was, in the same digits.
+        const text = try json.stringify(testing.allocator, tree, .{});
+        defer testing.allocator.free(text);
+        const converted = try json.reformat(testing.allocator, bytes, .{}, .{});
+        defer testing.allocator.free(converted);
+        try testing.expectEqualStrings(text, converted);
+
+        const recoded = try json.reformat(testing.allocator, text, .{}, .{ .format = .cbor });
+        defer testing.allocator.free(recoded);
+        try testing.expectEqualSlices(u8, bytes, recoded);
     }
 }
 
@@ -302,6 +449,57 @@ test "damaged text never crashes the reader, in any syntax" {
     }
 }
 
+test "damaged CBOR never crashes the reader, and valid agrees with parse" {
+    var prng = std.Random.DefaultPrng.init(0xBADCB0);
+    const random = prng.random();
+    const seeds = [_][]const u8{
+        &hex("d9d9f7 bf 646e616d65 63416461 6474616773 82 6161 7f 6162 6163 ff 63706f73 a2 6178 f93e00 6179 fa3dcccccd 626f6b f5 646e6f6e65 f6 ff"),
+        &hex("9f 01 fb3ff199999999999a 20 3903e7 5f 4201ff 4103 ff c1 1a514b67b0 81 81 81 a0 1bffffffffffffffff 64f0908591 ff"),
+        &hex("a3 6161 d818 4401020304 6162 9f bf ff 80 ff 6163 bf 6164 f97c00 ff"),
+    };
+    var buf: [256]u8 = undefined;
+    for (0..20_000) |round| {
+        const seed = seeds[round % seeds.len];
+        @memcpy(buf[0..seed.len], seed);
+        var len = seed.len;
+        for (0..1 + random.uintLessThan(usize, 4)) |_| {
+            const at = random.uintLessThan(usize, len + 1);
+            switch (random.uintLessThan(u8, 3)) {
+                0 => if (at < len) {
+                    buf[at] = random.int(u8);
+                },
+                1 => if (len < buf.len) {
+                    std.mem.copyBackwards(u8, buf[at + 1 .. len + 1], buf[at..len]);
+                    buf[at] = if (random.boolean()) random.int(u8) else "\xff\x9f\xbf\x7f\x5f\x18\x1b\xf9\xfb\xc2\xd9\x00"[random.uintLessThan(usize, 12)];
+                    len += 1;
+                },
+                else => if (at < len) {
+                    std.mem.copyForwards(u8, buf[at .. len - 1], buf[at + 1 .. len]);
+                    len -= 1;
+                },
+            }
+        }
+        const bytes = buf[0..len];
+        var diagnostics: json.Diagnostics = .{};
+        const accepted = if (json.parse(testing.allocator, bytes, .{ .format = .cbor, .diagnostics = &diagnostics })) |doc| blk: {
+            defer doc.deinit();
+            const written = try json.stringify(testing.allocator, doc.root, .{ .format = .cbor, .non_finite = .literal });
+            defer testing.allocator.free(written);
+            const back = try json.parse(testing.allocator, written, .{});
+            defer back.deinit();
+            try testing.expect(back.root.eql(doc.root) or hasNan(doc.root));
+            break :blk true;
+        } else |err| switch (err) {
+            error.SyntaxError, error.TooDeep => blk: {
+                try testing.expect(diagnostics.binary and diagnostics.message().len > 0);
+                break :blk false;
+            },
+            else => return err,
+        };
+        try testing.expectEqual(accepted, json.valid(bytes, .{ .format = .cbor }));
+    }
+}
+
 fn hasNan(v: Value) bool {
     return switch (v) {
         .float => |f| !std.math.isFinite(f),
@@ -378,6 +576,16 @@ fn everything(gpa: std.mem.Allocator) !void {
     defer gpa.free(pretty);
     const copy = try doc.clone(doc.root);
     try doc.merge(copy);
+
+    const bytes = try json.stringify(gpa, typed.value, .{ .format = .cbor });
+    defer gpa.free(bytes);
+    const from_cbor = try json.parseAs(Save, gpa, bytes, .{});
+    defer from_cbor.deinit();
+    const cbor_as_text = try json.reformat(gpa, bytes, .{}, .{ .indent = 2 });
+    defer gpa.free(cbor_as_text);
+    // Strings in parts and byte strings, which take memory of their own.
+    const pieces = try json.parse(gpa, &hex("d9d9f7 a2 7f 6161 6162 ff 5f 4101 4102 ff 6163 83 01 fa3dcccccd 4401020304"), .{});
+    defer pieces.deinit();
 }
 
 test "every allocation that can fail, failing, leaks nothing" {

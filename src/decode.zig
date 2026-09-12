@@ -16,6 +16,10 @@ const Value = value_mod.Value;
 pub const Options = struct {
     /// Strict JSON, or JSON with comments, or all of JSON5.
     syntax: Reader.Syntax = .json,
+    /// JSON text or CBOR. Null tells them apart by the CBOR self-described
+    /// tag, which `stringify` and `save` write at the start of CBOR; CBOR
+    /// from elsewhere, without one, has to be named.
+    format: ?Reader.Format = null,
     /// Nesting deeper than this is refused with `error.TooDeep`.
     max_depth: u16 = 512,
     duplicate_keys: value_mod.DuplicateKeys = .last,
@@ -84,7 +88,7 @@ pub fn parseValueAs(comptime T: type, gpa: Allocator, value: Value, options: Opt
 }
 
 pub fn readerOptions(options: Options) Reader.Options {
-    return .{ .syntax = options.syntax, .max_depth = options.max_depth, .diagnostics = options.diagnostics };
+    return .{ .syntax = options.syntax, .format = options.format, .max_depth = options.max_depth, .diagnostics = options.diagnostics };
 }
 
 fn parseFrom(comptime T: type, gpa: Allocator, reader: *Reader, options: Options) Error!Parsed(T) {

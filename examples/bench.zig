@@ -3,6 +3,7 @@
 //! Reading and writing timed against `std.json`, on three documents shaped
 //! like what a game keeps in JSON: a tile map (numbers), a list of records
 //! (strings and small objects) and a string table (one very wide object).
+//! Then the same three as CBOR against the same three as text.
 //!
 //!   zig build bench
 //!
@@ -75,7 +76,51 @@ pub fn main(init: std.process.Init) !void {
     try compare(out, io, "string table: parse to a tree", strings_text.len, parseTree, parseStdTree, .{ gpa, strings_text });
     try compare(out, io, "string table: look up every key", strings_text.len, lookupOurs, lookupStd, .{ gpa, strings_text });
     try out.print("\nsizes: tile map {d} bytes, records {d}, string table {d}\n", .{ map_text.len, records_text.len, strings_text.len });
+
+    const map_cbor = try json.stringify(arena.allocator(), map, .{ .format = .cbor });
+    const records_cbor = try json.stringify(arena.allocator(), records, .{ .format = .cbor });
+    const strings_cbor = try json.stringify(arena.allocator(), strings, .{ .format = .cbor });
+
+    try out.print("\n{s:<34} {s:>12} {s:>12} {s:>8}\n", .{ "fluxion-json, CBOR against text", "CBOR", "JSON text", "ratio" });
+    try compareFormats(out, io, "tile map: parse to a tree", parseTree, .{ gpa, map_cbor }, .{ gpa, map_text });
+    try compareFormats(out, io, "tile map: parse into structs", parseTyped, .{ gpa, Map, map_cbor }, .{ gpa, Map, map_text });
+    try compareFormats(out, io, "tile map: write", writeFormat, .{ gpa, map, json.Format.cbor }, .{ gpa, map, json.Format.json });
+    try compareFormats(out, io, "records: parse to a tree", parseTree, .{ gpa, records_cbor }, .{ gpa, records_text });
+    try compareFormats(out, io, "records: parse into structs", parseTyped, .{ gpa, []const Record, records_cbor }, .{ gpa, []const Record, records_text });
+    try compareFormats(out, io, "records: write", writeFormat, .{ gpa, records, json.Format.cbor }, .{ gpa, records, json.Format.json });
+    try compareFormats(out, io, "string table: parse to a tree", parseTree, .{ gpa, strings_cbor }, .{ gpa, strings_text });
+    try out.print("\nsizes as CBOR: tile map {d} bytes ({d}% of the text), records {d} ({d}%), string table {d} ({d}%)\n", .{
+        map_cbor.len,     percent(map_cbor.len, map_text.len),
+        records_cbor.len, percent(records_cbor.len, records_text.len),
+        strings_cbor.len, percent(strings_cbor.len, strings_text.len),
+    });
     try out.flush();
+}
+
+/// The same work on the same values, as CBOR and as JSON text: times, and
+/// how many times as fast CBOR is.
+fn compareFormats(
+    out: *std.Io.Writer,
+    io: std.Io,
+    label: []const u8,
+    comptime f: anytype,
+    cbor_args: anytype,
+    text_args: anytype,
+) !void {
+    var best_cbor: u64 = std.math.maxInt(u64);
+    var best_text: u64 = std.math.maxInt(u64);
+    for (0..rounds) |_| {
+        best_cbor = @min(best_cbor, try time(io, f, cbor_args));
+        best_text = @min(best_text, try time(io, f, text_args));
+    }
+    const cbor_ms = @as(f64, @floatFromInt(best_cbor)) / std.time.ns_per_ms;
+    const text_ms = @as(f64, @floatFromInt(best_text)) / std.time.ns_per_ms;
+    try out.print("{s:<34} {d:>9.2} ms {d:>9.2} ms {d:>7.2}x\n", .{ label, cbor_ms, text_ms, text_ms / cbor_ms });
+    try out.flush();
+}
+
+fn percent(part: usize, whole: usize) usize {
+    return part * 100 / whole;
 }
 
 fn compare(
@@ -130,6 +175,11 @@ fn parseStdTyped(gpa: std.mem.Allocator, comptime T: type, text: []const u8) !vo
 fn writeOurs(gpa: std.mem.Allocator, value: anytype, indented: bool) !void {
     const text = try json.stringify(gpa, value, .{ .indent = if (indented) 2 else 0 });
     gpa.free(text);
+}
+
+fn writeFormat(gpa: std.mem.Allocator, value: anytype, format: json.Format) !void {
+    const bytes = try json.stringify(gpa, value, .{ .format = format });
+    gpa.free(bytes);
 }
 
 fn writeStd(gpa: std.mem.Allocator, value: anytype, indented: bool) !void {

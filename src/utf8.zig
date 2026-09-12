@@ -41,6 +41,19 @@ pub fn plainRun(bytes: []const u8, start: usize, quote: u8) usize {
     return i;
 }
 
+/// The first index from `start` of a byte past ASCII. Sixteen bytes at a
+/// time while it can.
+pub fn asciiRun(bytes: []const u8, start: usize) usize {
+    const V = @Vector(16, u8);
+    var i = start;
+    while (i + 16 <= bytes.len) : (i += 16) {
+        const chunk: V = bytes[i..][0..16].*;
+        if (std.simd.firstTrue(chunk >= @as(V, @splat(0x80)))) |at| return i + at;
+    }
+    while (i < bytes.len and bytes[i] < 0x80) i += 1;
+    return i;
+}
+
 /// How long `s` is once quoted and escaped by `writeQuoted`.
 pub fn quotedLength(s: []const u8, ascii: bool) usize {
     var n: usize = 2 + s.len;

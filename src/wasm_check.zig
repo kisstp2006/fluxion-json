@@ -24,5 +24,7 @@ export fn fluxion_json_wasm_check(text: [*]const u8, len: usize) u32 {
     doc.root.put("level", save.value.level + 1) catch return 3;
     const out = json.stringify(gpa, doc.root, .{ .indent = 2, .sort_keys = true }) catch return 4;
     if (!json.valid(out, .{})) return 5;
+    const binary = json.stringify(gpa, save.value, .{ .format = .cbor }) catch return 6;
+    if (!json.valid(binary, .{})) return 7;
     return @intCast(out.len);
 }

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! JSON written a piece at a time into a `std.Io.Writer`.
+//! JSON written a piece at a time into a `std.Io.Writer`, as text or as
+//! CBOR.
 //!
 //! ```zig
 //! var writer: json.Writer = .init(out, .{ .indent = 2 });
@@ -28,10 +29,17 @@ const Value = value_mod.Value;
 const Builder = value_mod.Builder;
 const encode = @import("encode.zig");
 const Reader = @import("Reader.zig");
+const cbor = @import("cbor.zig");
 
 const Writer = @This();
 
+pub const Format = Reader.Format;
+
 pub const Options = struct {
+    /// `.cbor` writes CBOR (RFC 8949) rather than text: the same values in
+    /// fewer bytes. The layout options do not apply to it; `sort_keys`,
+    /// `skip_nulls`, `skip_defaults` and `non_finite` do.
+    format: Format = .json,
     /// Spaces for each level of nesting. 0 writes everything on one line and
     /// without spaces, as `JSON.stringify` does without its third argument.
     indent: u8 = 0,
@@ -54,7 +62,8 @@ pub const Options = struct {
     /// Leave out struct fields that hold their default value, so a settings
     /// file lists only what was changed.
     skip_defaults: bool = false,
-    /// What NaN and infinity become, since JSON has no number for them.
+    /// What NaN and infinity become, since JSON has no number for them. In
+    /// CBOR, `.literal` writes them as the floats they are.
     non_finite: NonFinite = .null,
 };
 
@@ -77,13 +86,18 @@ objects: [Reader.max_depth_limit / 64]u64 = @splat(0),
 first: bool = true,
 awaiting_value: bool = false,
 layout: Layout = .{},
+/// Whether the CBOR self-described tag has gone out, ahead of the value.
+tagged: bool = false,
 
-const Target = union(enum) { text: *std.Io.Writer, tree: *Builder };
+const Target = union(enum) { text: *std.Io.Writer, tree: *Builder, cbor: *std.Io.Writer };
 const max_line_width = 240;
 const tab_columns = 4;
 
 pub fn init(out: *std.Io.Writer, options: Options) Writer {
-    return .{ .options = options, .target = .{ .text = out } };
+    return .{
+        .options = options,
+        .target = if (options.format == .cbor) .{ .cbor = out } else .{ .text = out },
+    };
 }
 
 /// A writer that builds a `Value` tree rather than text.
@@ -112,6 +126,7 @@ pub fn key(w: *Writer, name: []const u8) Error!void {
     assert(w.inObject() and !w.awaiting_value);
     switch (w.target) {
         .tree => |b| try b.key(name),
+        .cbor => |out| try cbor.writeText(out, name),
         .text => |out| if (w.options.indent == 0) {
             if (!w.first) try out.writeByte(',');
             w.first = false;
@@ -138,6 +153,7 @@ pub fn writeNull(w: *Writer) Error!void {
     switch (w.target) {
         .tree => |b| try b.add(.null),
         .text => |out| try w.textScalar(out, .{ .raw = "null" }),
+        .cbor => |out| try w.cborScalar(out, &.{0xF6}),
     }
     w.afterScalar();
 }
@@ -146,6 +162,7 @@ pub fn writeBool(w: *Writer, b: bool) Error!void {
     switch (w.target) {
         .tree => |builder| try builder.add(.{ .bool = b }),
         .text => |out| try w.textScalar(out, .{ .raw = if (b) "true" else "false" }),
+        .cbor => |out| try w.cborScalar(out, &.{if (b) 0xF5 else 0xF4}),
     }
     w.afterScalar();
 }
@@ -154,11 +171,16 @@ pub fn writeString(w: *Writer, s: []const u8) Error!void {
     switch (w.target) {
         .tree => |b| try b.string(s),
         .text => |out| try w.textScalar(out, .{ .string = s }),
+        .cbor => |out| {
+            try w.cborStart(out);
+            try cbor.writeText(out, s);
+        },
     }
     w.afterScalar();
 }
 
-/// An integer of any width, written in full.
+/// An integer of any width, written in full. In CBOR one past what it holds,
+/// -2^64 to 2^64 - 1, is written as a float, as a tree holds one past i64.
 pub fn writeInt(w: *Writer, value: anytype) Error!void {
     switch (w.target) {
         .tree => |b| try b.add(if (std.math.cast(i64, value)) |i| .{ .int = i } else .{ .float = @floatFromInt(value) }),
@@ -169,11 +191,17 @@ pub fn writeInt(w: *Writer, value: anytype) Error!void {
                 try w.compactRaw(out, &buf, buf.len - digits.len);
             } else try w.prettyValue(out, .{ .raw = digits });
         },
+        .cbor => |out| {
+            const head = cbor.intHead(value) orelse return w.writeFloat(@as(f64, @floatFromInt(value)));
+            try w.cborStart(out);
+            try cbor.writeHead(out, head.major, head.argument);
+        },
     }
     w.afterScalar();
 }
 
-/// A float of any width, in the fewest digits that read back as it.
+/// A float of any width, in the fewest digits that read back as it - or in
+/// CBOR, the fewest bytes.
 pub fn writeFloat(w: *Writer, value: anytype) Error!void {
     switch (w.target) {
         .tree => |b| try b.add(.{ .float = faithful(value) }),
@@ -190,6 +218,14 @@ pub fn writeFloat(w: *Writer, value: anytype) Error!void {
                 .fail => return error.NonFiniteNumber,
             }
         },
+        .cbor => |out| {
+            if (std.math.isFinite(value) or w.options.non_finite == .literal) {
+                try w.cborStart(out);
+                try cbor.writeFloat(out, value);
+            } else if (w.options.non_finite == .null) {
+                try w.cborScalar(out, &.{0xF6});
+            } else return error.NonFiniteNumber;
+        },
     }
     w.afterScalar();
 }
@@ -201,6 +237,12 @@ pub fn writeNumber(w: *Writer, n: Number) Error!void {
         .tree => |b| {
             try b.add(value_mod.numberValue(n));
             w.afterScalar();
+        },
+        .cbor => {
+            if (n.isInteger()) {
+                if (n.asInt(i128)) |i| return w.writeInt(i);
+            }
+            return w.writeFloat(n.asFloat(f64));
         },
         .text => |out| {
             if (!number.isJson(n.text)) {
@@ -230,11 +272,30 @@ fn afterScalar(w: *Writer) void {
     w.first = false;
 }
 
+/// The self-described tag, once, ahead of the value: what tells a reader
+/// these bytes are CBOR.
+fn cborStart(w: *Writer, out: *std.Io.Writer) Error!void {
+    assert(!w.inObject() or w.awaiting_value);
+    if (w.tagged) return;
+    w.tagged = true;
+    try out.writeAll(&cbor.self_described);
+}
+
+fn cborScalar(w: *Writer, out: *std.Io.Writer, bytes: []const u8) Error!void {
+    try w.cborStart(out);
+    try out.writeAll(bytes);
+}
+
 fn open(w: *Writer, is_object: bool) Error!void {
     assert(!w.inObject() or w.awaiting_value);
     if (w.depth >= Reader.max_depth_limit) return error.TooDeep;
     switch (w.target) {
         .tree => |b| try b.begin(is_object, 0),
+        // The length is not known yet, so the container is closed by a break.
+        .cbor => |out| {
+            try w.cborStart(out);
+            try out.writeByte(@as(u8, if (is_object) 0xBF else 0x9F));
+        },
         .text => |out| if (w.options.indent == 0) {
             try w.compactSeparator(out);
             try out.writeByte(if (is_object) '{' else '[');
@@ -254,6 +315,7 @@ fn close(w: *Writer, is_object: bool) Error!void {
             error.OutOfMemory => return error.OutOfMemory,
             error.DuplicateKey => unreachable,
         },
+        .cbor => |out| try out.writeByte(cbor.break_byte),
         .text => |out| if (w.options.indent == 0) {
             try out.writeByte(if (is_object) '}' else ']');
         } else try w.prettyClose(out),
@@ -977,4 +1039,60 @@ test "strings too long to hold back are written straight out" {
     const text = out.buffered();
     try testing.expect(std.mem.startsWith(u8, text, "{\n  \"short\": 1,\n  \"xxx"));
     try testing.expect(std.mem.endsWith(u8, text, "xxx\"\n}"));
+}
+
+fn expectCbor(options: Options, comptime expected_hex: []const u8, comptime build: fn (*Writer) Error!void) !void {
+    var buf: [4096]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buf);
+    var with_cbor = options;
+    with_cbor.format = .cbor;
+    var writer: Writer = .init(&out, with_cbor);
+    try build(&writer);
+    try testing.expectEqualSlices(u8, &cbor.hex(expected_hex), out.buffered());
+}
+
+test "CBOR is the same values in binary, after the tag that says it is CBOR" {
+    const expected = "d9d9f7 bf 646e616d65 63416461 63706f73 bf 6178 f93e00 6179 f9c000 ff 6474616773 9fff" ++
+        " 69696e76656e746f7279 9f bf 646974656d 6573776f7264 65636f756e74 01 ff f6 ff 65616c697665 f5 ff";
+    try expectCbor(.{}, expected, sample);
+    try expectCbor(.{ .indent = 2, .line_width = 20 }, expected, sample);
+}
+
+test "non-finite floats in CBOR follow the option, and are floats when literal" {
+    const build = struct {
+        fn build(w: *Writer) Error!void {
+            try w.beginArray();
+            try w.writeFloat(std.math.nan(f64));
+            try w.writeFloat(-std.math.inf(f32));
+            try w.endArray();
+        }
+    }.build;
+    try expectCbor(.{}, "d9d9f7 9f f6 f6 ff", build);
+    try expectCbor(.{ .non_finite = .literal }, "d9d9f7 9f f97e00 f9fc00 ff", build);
+    try testing.expectError(error.NonFiniteNumber, expectCbor(.{ .non_finite = .fail }, "", build));
+}
+
+test "an integer past what CBOR holds is written as the float nearest it" {
+    try expectCbor(.{}, "d9d9f7 9f 1bffffffffffffffff 3bffffffffffffffff fb47f0000000000000 faff000000 ff", struct {
+        fn build(w: *Writer) Error!void {
+            try w.beginArray();
+            try w.writeInt(@as(u64, std.math.maxInt(u64)));
+            try w.writeInt(@as(i128, -18446744073709551616));
+            try w.writeInt(@as(u128, std.math.maxInt(u128)));
+            try w.writeInt(@as(i128, std.math.minInt(i128)));
+            try w.endArray();
+        }
+    }.build);
+}
+
+test "numbers from a reader keep their kind in CBOR" {
+    try expectCbor(.{}, "d9d9f7 9f f93e00 00 181f f95640 1bffffffffffffffff fa5f800000 f6 ff", struct {
+        fn build(w: *Writer) Error!void {
+            try w.beginArray();
+            for ([_][]const u8{ "1.50", "-0", "0x1F", "1e2", "18446744073709551615", "18446744073709551616", "-Infinity" }) |text| {
+                try w.writeNumber(.{ .text = text });
+            }
+            try w.endArray();
+        }
+    }.build);
 }

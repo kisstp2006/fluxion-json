@@ -18,6 +18,10 @@
 //! // And back out, like JSON.stringify.
 //! const out = try json.stringify(gpa, config.value, .{ .indent = 2 });
 //! defer gpa.free(out);
+//!
+//! // The same values as CBOR, which every read above takes as well.
+//! const bytes = try json.stringify(gpa, config.value, .{ .format = .cbor });
+//! defer gpa.free(bytes);
 //! ```
 
 const std = @import("std");
@@ -42,6 +46,7 @@ pub const Parsed = decode.Parsed;
 pub const ParseOptions = decode.Options;
 pub const WriteOptions = Writer.Options;
 pub const Syntax = Reader.Syntax;
+pub const Format = Reader.Format;
 pub const DuplicateKeys = value_mod.DuplicateKeys;
 pub const UnknownFields = decode.UnknownFields;
 pub const NonFinite = Writer.NonFinite;
@@ -53,8 +58,9 @@ pub const StringifyError = error{ OutOfMemory, TooDeep, NonFiniteNumber };
 pub const LoadError = Error || Io.Dir.ReadFileAllocError;
 pub const SaveError = StringifyError || Io.Dir.CreateFileAtomicError || Io.File.Writer.Error || Io.File.Atomic.ReplaceError;
 
-/// Read JSON text into a tree, as `JSON.parse` does. The text can be freed
-/// as soon as this returns: the document holds copies of what it needs.
+/// Read JSON text into a tree, as `JSON.parse` does - or CBOR, told apart by
+/// its self-described tag. The text can be freed as soon as this returns: the
+/// document holds copies of what it needs.
 pub fn parse(gpa: Allocator, text: []const u8, options: ParseOptions) Error!Document {
     if (options.diagnostics) |d| d.* = .{};
     return parseDocument(gpa, text, options);
@@ -69,8 +75,8 @@ pub fn parseAs(comptime T: type, gpa: Allocator, text: []const u8, options: Pars
     return decode.parseAs(T, gpa, text, options);
 }
 
-/// Write any value as JSON text, as `JSON.stringify` does. The caller frees
-/// the result.
+/// Write any value as JSON text, as `JSON.stringify` does - or, with
+/// `.format = .cbor`, as CBOR bytes. The caller frees the result.
 ///
 ///   bool, integers, floats        true and false, numbers; floats in the fewest digits that read back the same
 ///   ?T                            null, or the T
@@ -120,9 +126,11 @@ pub fn Formatter(comptime T: type) type {
 }
 
 /// Whether `text` is one JSON value and nothing else, in the syntax the
-/// options name. Allocates nothing.
+/// options name - or one CBOR item JSON can hold. Allocates nothing.
 pub fn valid(text: []const u8, options: ParseOptions) bool {
-    var reader: Reader = .init(Allocator.failing, text, .{ .syntax = options.syntax, .max_depth = options.max_depth });
+    var frames: Reader.CborFrames = undefined;
+    var fixed: std.heap.FixedBufferAllocator = .init(std.mem.asBytes(&frames));
+    var reader: Reader = .init(fixed.allocator(), text, .{ .syntax = options.syntax, .format = options.format, .max_depth = options.max_depth });
     defer reader.deinit();
     reader.skipValue() catch return false;
     return (reader.next() catch return false) == null;
@@ -130,7 +138,8 @@ pub fn valid(text: []const u8, options: ParseOptions) bool {
 
 /// Lay JSON text out again - indented, compact, ASCII-only - without building
 /// a tree. Keys stay in their order and numbers keep their digits; comments
-/// go, and JSON5 comes out as JSON. The caller frees the result.
+/// go, and JSON5 comes out as JSON. With a `format` on either side it turns
+/// JSON into CBOR and back. The caller frees the result.
 pub fn reformat(gpa: Allocator, text: []const u8, parse_options: ParseOptions, options: WriteOptions) (Error || StringifyError)![]u8 {
     if (parse_options.diagnostics) |d| d.* = .{};
     var reader: Reader = .init(gpa, text, decode.readerOptions(parse_options));
@@ -158,8 +167,9 @@ pub fn reformat(gpa: Allocator, text: []const u8, parse_options: ParseOptions, o
     return out.toOwnedSlice();
 }
 
-/// Read a JSON file into a tree. `path` is relative to the working directory.
-/// Diagnostics name the file, so messages read `settings.json:3:14: ...`.
+/// Read a JSON or CBOR file into a tree. `path` is relative to the working
+/// directory. Diagnostics name the file, so messages read
+/// `settings.json:3:14: ...`.
 pub fn load(gpa: Allocator, io: Io, path: []const u8, options: ParseOptions) LoadError!Document {
     const text = try readFile(gpa, io, path, options);
     defer gpa.free(text);
@@ -173,10 +183,11 @@ pub fn loadAs(comptime T: type, gpa: Allocator, io: Io, path: []const u8, option
     return decode.parseAs(T, gpa, text, options);
 }
 
-/// Write any value to a JSON file, ending it with a line break. The file is
-/// written beside the old one and then put in its place, so a crash halfway
-/// through leaves the old file whole rather than half a new one. Directories
-/// on the way to `path` are made if they are missing.
+/// Write any value to a JSON file ending with a line break, or with
+/// `.format = .cbor` to a CBOR file. The file is written beside the old one
+/// and then put in its place, so a crash halfway through leaves the old file
+/// whole rather than half a new one. Directories on the way to `path` are
+/// made if they are missing.
 pub fn save(io: Io, path: []const u8, value: anytype, options: WriteOptions) SaveError!void {
     var file = try Io.Dir.cwd().createFileAtomic(io, path, .{ .replace = true, .make_path = true });
     defer file.deinit(io);
@@ -187,7 +198,7 @@ pub fn save(io: Io, path: []const u8, value: anytype, options: WriteOptions) Sav
         error.WriteFailed => file_writer.err.?,
         error.OutOfMemory, error.TooDeep, error.NonFiniteNumber => |e| e,
     };
-    file_writer.interface.writeByte('\n') catch return file_writer.err.?;
+    if (options.format == .json) file_writer.interface.writeByte('\n') catch return file_writer.err.?;
     try file_writer.flush();
     try file.replace(io);
 }
@@ -216,6 +227,7 @@ fn readFile(gpa: Allocator, io: Io, path: []const u8, options: ParseOptions) Io.
 test {
     _ = @import("number.zig");
     _ = @import("utf8.zig");
+    _ = @import("cbor.zig");
     _ = Diagnostics;
     _ = Reader;
     _ = Writer;
@@ -353,6 +365,62 @@ test "a file saved and loaded again" {
     var diagnostics: Diagnostics = .{};
     try testing.expectError(error.FileNotFound, load(testing.allocator, testing.io, "no/such/file.json", .{ .diagnostics = &diagnostics }));
     try testing.expectEqualStrings("cannot read the file: FileNotFound", diagnostics.message());
+}
+
+test "typed values come back from CBOR exactly as they went in" {
+    const Sample = struct {
+        f32_tenth: f32 = 0.1,
+        f64_tenth: f64 = 0.1,
+        f64_from_f32: f64 = @as(f32, 0.1),
+        half_max: f64 = 65504.0,
+        big: u64 = std.math.maxInt(u64),
+        small: i64 = std.math.minInt(i64),
+        name: []const u8 = "Ada ✓",
+        config: Config = .{ .title = "cbor", .bindings = &.{.{ .action = "jump", .key = "space" }} },
+    };
+    const bytes = try stringify(testing.allocator, Sample{}, .{ .format = .cbor });
+    defer testing.allocator.free(bytes);
+    const back = try parseAs(Sample, testing.allocator, bytes, .{});
+    defer back.deinit();
+    try testing.expectEqualDeep(Sample{}, back.value);
+
+    const text = try stringify(testing.allocator, Sample{}, .{});
+    defer testing.allocator.free(text);
+    const from_text = try parseAs(Sample, testing.allocator, text, .{});
+    defer from_text.deinit();
+    try testing.expectEqualDeep(from_text.value, back.value);
+}
+
+test "a CBOR file saved and loaded again, and one that is broken" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/saves/slot1.cbor", .{tmp.sub_path});
+
+    try save(testing.io, path, Config{ .title = "saved" }, .{ .format = .cbor });
+    const bytes = try Io.Dir.cwd().readFileAlloc(testing.io, path, testing.allocator, .unlimited);
+    defer testing.allocator.free(bytes);
+    try testing.expect(std.mem.startsWith(u8, bytes, "\xD9\xD9\xF7"));
+    try testing.expect(bytes[bytes.len - 1] != '\n');
+
+    const loaded = try loadAs(Config, testing.allocator, testing.io, path, .{});
+    defer loaded.deinit();
+    try testing.expectEqualStrings("saved", loaded.value.title);
+    const doc = try load(testing.allocator, testing.io, path, .{});
+    defer doc.deinit();
+    try testing.expectEqual(@as(?u32, 1280), doc.root.at("/window/width").asInt(u32));
+
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "broken.cbor", .data = "\xD9\xD9\xF7\xA1\x61\x61" });
+    var broken_buf: [128]u8 = undefined;
+    const broken = try std.fmt.bufPrint(&broken_buf, ".zig-cache/tmp/{s}/broken.cbor", .{tmp.sub_path});
+    var diagnostics: Diagnostics = .{};
+    try testing.expectError(error.SyntaxError, load(testing.allocator, testing.io, broken, .{ .diagnostics = &diagnostics }));
+    var buf: [256]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    try w.print("{f}", .{diagnostics});
+    var expected_buf: [256]u8 = undefined;
+    const expected = try std.fmt.bufPrint(&expected_buf, "{s}: byte 6: the CBOR ends before the map opened at byte 3 is closed", .{broken});
+    try testing.expectEqualStrings(expected, w.buffered());
 }
 
 test "diagnostics from a file name it" {

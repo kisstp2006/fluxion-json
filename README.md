@@ -9,6 +9,7 @@ JavaScript, Python, C# and Rust.
 | `parse`, `parseAs` | JSON text into a tree, or into your own types. |
 | `stringify`, `write`, `fmt` | Any value back out as text, compact or laid out. |
 | `load`, `loadAs`, `save` | The same, for files. Saving is atomic. |
+| `.format = .cbor` | All of the above in binary: CBOR (RFC 8949), the same values in fewer bytes. |
 | `Value`, `Document` | The tree: objects and arrays to read, change and build. |
 | `Reader`, `Writer` | One token at a time, for everything else. |
 | `Diagnostics` | Where reading went wrong and why, with the line and a caret under it. |
@@ -156,6 +157,48 @@ missing, and ends the file with a line break. A path is relative to the
 working directory; for anything else - a pack file, an asset system - read
 the bytes yourself and call `parse` or `parseAs`.
 
+### Binary: CBOR
+
+Every call above reads and writes CBOR too: RFC 8949, the binary form of the
+same values. It is for the files only your own program opens - a save, a
+level, a cache - where nobody reads the text. A tile map of numbers takes
+57% of the bytes it takes as text, and records of strings 82%; writing is
+half as fast again, and reading takes about as long as reading the text.
+
+```zig
+try json.save(io, "saves/slot1.cbor", save_data, .{ .format = .cbor });
+const slot = try json.loadAs(Save, gpa, io, "saves/slot1.cbor", .{});  // no need to say which
+const text = try json.reformat(gpa, bytes, .{}, .{ .indent = 2 });     // to look inside one
+```
+
+Reading tells the two apart on its own. Everything written as CBOR starts
+with the three bytes RFC 8949 sets aside for saying "this is CBOR",
+`D9 D9 F7`, which no JSON text can start with. CBOR from another program may
+not start with them, and is read with `.format = .cbor`.
+
+It is one model with two spellings, so a struct reads the same from either,
+and a file converts from one to the other and back without losing anything.
+Where CBOR holds more than JSON, it is read the way RFC 8949 turns it into
+JSON: a byte string becomes base64url text, and a tag is passed over to what
+it tags. What JSON has no room for - a map with numbers for keys, a big
+number - is refused, with a message that says which byte it is at:
+
+```
+level.cbor: byte 1822: a key must be text for JSON, and this map has a number as one
+```
+
+A number takes as few bytes as hold it exactly - three for `1.5`, five for
+most `f32`s - and reads back as exactly the value written. That has one
+consequence to know about. An `f32` `0.1` really holds `0.100000001490116...`: JSON text
+writes it as `0.1` because those are all the digits an `f32` has, but CBOR
+keeps the float itself. Read back into an `f32` it is the same `0.1` both
+ways; read into an `f64`, or into a tree, from CBOR it is the value the `f32`
+really held.
+
+Of the writing options, `sort_keys`, `skip_nulls`, `skip_defaults` and
+`non_finite` apply to CBOR, and the layout ones do not. `non_finite =
+.literal` writes NaN and the infinities as the floats they are.
+
 ### Change and build a tree
 
 ```zig
@@ -253,6 +296,8 @@ problem.
 | `DisallowUnknownFields()`, `deny_unknown_fields` | `.{ .unknown_fields = .fail }` |
 | `toJSON()`, Dart's `toJson` and `fromJson` | `pub fn toJson(...)` and `pub fn fromJson(...)` |
 | `JsonCommentHandling.Skip`, `AllowTrailingCommas` | `.{ .syntax = .jsonc }` |
+| `cbor2.dumps(v)`, `serde_cbor::to_vec(&v)` | `json.stringify(gpa, v, .{ .format = .cbor })` |
+| `cbor2.loads(b)`, `serde_cbor::from_slice::<T>(&b)` | `json.parse(gpa, bytes, .{})`, `json.parseAs(T, gpa, bytes, .{})` |
 
 ## What it decides for you, and why
 
@@ -360,9 +405,10 @@ const Color = struct {
 ## One token at a time
 
 `Reader` hands out tokens - `.object_begin`, `.key`, `.string`, `.number`,
-and so on - from text or from a `Value`, and `Writer` takes them back. They
-are what everything above is made of, and what to reach for when a file is a
-stream of records, or a converter wants to see every token:
+and so on - from text, from CBOR or from a `Value`, and `Writer` takes them
+back, as text or as CBOR. They are what everything above is made of, and
+what to reach for when a file is a stream of records, or a converter wants
+to see every token:
 
 ```zig
 var reader: json.Reader = .init(gpa, text, .{});
@@ -403,6 +449,19 @@ from the text, by code that only runs when something is wrong. The one case
 that is slower is the one doing more work - `std.json` gives every item of an
 indented object a line, and this lays each object out to see whether it fits
 on one.
+
+The same three documents as CBOR, against themselves as JSON text:
+
+| | CBOR against JSON text |
+| --- | --- |
+| size: tile map, records, string table | 57%, 82% and 90% of the bytes |
+| write | 1.5 - 1.6 times as fast |
+| read, tile map | 1.05 - 1.2 times as fast |
+| read, records and string table | about the same: 0.85 - 1.02 |
+
+Reading gains less than the size suggests because a `Number` token is text,
+whatever it was read from: a number in CBOR is written out as digits, and
+read back from them when it is asked for as a type.
 
 ## Install
 
@@ -448,6 +507,13 @@ writer's own sums. Twenty thousand damaged documents are read in all three
 syntaxes without a crash, random trees are read by `std.json` too and must
 come out the same, and every allocation that can fail is made to fail in
 turn, leaking nothing.
+
+CBOR is held to RFC 8949's own examples, each read as the JSON it stands for
+or refused where JSON has no room for it. Four hundred random trees go
+through CBOR and must come back equal, convert to the same text as the tree
+written straight out, and convert back to the same bytes. Twenty thousand
+damaged CBOR documents are read without a crash, and `valid` must agree
+with `parse` about every one.
 
 ## Where it sits
 
