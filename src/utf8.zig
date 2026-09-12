@@ -81,7 +81,17 @@ pub fn quotedLength(s: []const u8, ascii: bool) usize {
 /// escaped, and each byte that is not UTF-8 replaced with U+FFFD so the
 /// result is always valid. `ascii` escapes everything past U+007F as well.
 pub fn writeQuoted(out: *std.Io.Writer, s: []const u8, ascii: bool) std.Io.Writer.Error!void {
-    try out.writeByte('"');
+    return writeString(out, s, ascii, true);
+}
+
+/// What `writeQuoted` puts between the quotes, for a string written a part
+/// at a time.
+pub fn writeEscaped(out: *std.Io.Writer, s: []const u8, ascii: bool) std.Io.Writer.Error!void {
+    return writeString(out, s, ascii, false);
+}
+
+fn writeString(out: *std.Io.Writer, s: []const u8, ascii: bool, comptime quoted: bool) std.Io.Writer.Error!void {
+    if (quoted) try out.writeByte('"');
     var run: usize = 0;
     var i: usize = 0;
     while (true) {
@@ -115,7 +125,33 @@ pub fn writeQuoted(out: *std.Io.Writer, s: []const u8, ascii: bool) std.Io.Write
         i += len;
     }
     try out.writeAll(s[run..]);
-    try out.writeByte('"');
+    if (quoted) try out.writeByte('"');
+}
+
+/// How much of `s` is whole characters: all of it, unless it ends inside
+/// one that the bytes after it could still complete. An unfinished
+/// character is at most three bytes, so only the last three are looked at.
+pub fn wholeLength(s: []const u8) usize {
+    var lead = s.len;
+    while (lead > 0 and s.len - lead < 3) {
+        lead -= 1;
+        if (s[lead] & 0xC0 == 0x80) continue;
+        const wanted = leadLength(s[lead]) orelse return s.len;
+        return if (s.len - lead < wanted) lead else s.len;
+    }
+    return s.len;
+}
+
+/// How long a character starting with `lead` is, from its first byte alone;
+/// null for a byte no character starts with.
+pub fn leadLength(lead: u8) ?usize {
+    return switch (lead) {
+        0x00...0x7F => 1,
+        0xC2...0xDF => 2,
+        0xE0...0xEF => 3,
+        0xF0...0xF4 => 4,
+        else => null,
+    };
 }
 
 /// What an ASCII byte becomes: one byte for itself, a two-character escape,

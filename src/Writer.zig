@@ -88,6 +88,11 @@ awaiting_value: bool = false,
 layout: Layout = .{},
 /// Whether the CBOR self-described tag has gone out, ahead of the value.
 tagged: bool = false,
+in_string: bool = false,
+/// The start of a character the last part of a string ended inside, held
+/// back until the next part completes it.
+pending: [4]u8 = undefined,
+pending_len: u8 = 0,
 
 const Target = union(enum) { text: *std.Io.Writer, tree: *Builder, cbor: *std.Io.Writer };
 const max_line_width = 240;
@@ -177,6 +182,79 @@ pub fn writeString(w: *Writer, s: []const u8) Error!void {
         },
     }
     w.afterScalar();
+}
+
+/// A string written a part at a time, for one too long to hold whole - a
+/// file's base64, say - between `beginString` and `endString`, with nothing
+/// else written in between. A part may end inside a character; the next part
+/// brings the rest of it. Indented output cannot measure such a string, so
+/// the object or array it is in gets a line for each member or item.
+pub fn beginString(w: *Writer) Error!void {
+    assert(!w.in_string and (!w.inObject() or w.awaiting_value));
+    switch (w.target) {
+        .tree => {},
+        // Text of unknown length: parts of known length, then a break.
+        .cbor => |out| {
+            try w.cborStart(out);
+            try out.writeByte(0x7F);
+        },
+        .text => |out| {
+            if (w.options.indent == 0) try w.compactSeparator(out) else try w.prettyStringStart(out);
+            try out.writeByte('"');
+        },
+    }
+    w.in_string = true;
+}
+
+pub fn writeStringPart(w: *Writer, part: []const u8) Error!void {
+    assert(w.in_string);
+    var rest = part;
+    if (w.pending_len > 0) {
+        const wanted = utf8.leadLength(w.pending[0]).?;
+        while (w.pending_len < wanted and rest.len > 0 and rest[0] & 0xC0 == 0x80) {
+            w.pending[w.pending_len] = rest[0];
+            w.pending_len += 1;
+            rest = rest[1..];
+        }
+        if (w.pending_len < wanted and rest.len == 0) return;
+        try w.stringBytes(w.pending[0..w.pending_len]);
+        w.pending_len = 0;
+    }
+    const whole = utf8.wholeLength(rest);
+    try w.stringBytes(rest[0..whole]);
+    @memcpy(w.pending[0 .. rest.len - whole], rest[whole..]);
+    w.pending_len = @intCast(rest.len - whole);
+}
+
+pub fn endString(w: *Writer) Error!void {
+    assert(w.in_string);
+    try w.stringBytes(w.pending[0..w.pending_len]);
+    w.pending_len = 0;
+    switch (w.target) {
+        .tree => |b| try b.endString(),
+        .cbor => |out| try out.writeByte(cbor.break_byte),
+        .text => |out| {
+            try out.writeByte('"');
+            if (w.options.indent != 0) w.layout.column += 1;
+        },
+    }
+    w.in_string = false;
+    w.afterScalar();
+}
+
+/// Whole characters of a string written in parts, or bytes that are not
+/// UTF-8, which become U+FFFD.
+fn stringBytes(w: *Writer, s: []const u8) Error!void {
+    if (s.len == 0) return;
+    switch (w.target) {
+        .tree => |b| try b.stringPart(s),
+        .cbor => |out| try cbor.writeText(out, s),
+        .text => |out| {
+            const ascii = w.options.escape_unicode;
+            try utf8.writeEscaped(out, s, ascii);
+            if (w.options.indent != 0) w.layout.column += utf8.quotedLength(s, ascii) - 2;
+        },
+    }
 }
 
 /// An integer of any width, written in full. In CBOR one past what it holds,
@@ -499,6 +577,15 @@ fn prettyValue(w: *Writer, out: *std.Io.Writer, piece: Piece) Error!void {
     }
     try w.unfold(out);
     return w.prettyValue(out, piece);
+}
+
+/// Where a string written in parts starts. Its length is not known, so
+/// nothing is held back around it, and in a filled list it starts a line.
+fn prettyStringStart(w: *Writer, out: *std.Io.Writer) Error!void {
+    const l = &w.layout;
+    while (l.holding) try w.unfold(out);
+    try w.linePrefix(out, if (l.depth == 0 or l.style == .expanded) 0 else w.lineWidth());
+    l.column += 1;
 }
 
 /// Escape `piece` into the text buffer after what is held there, without
@@ -1093,6 +1180,205 @@ test "numbers from a reader keep their kind in CBOR" {
                 try w.writeNumber(.{ .text = text });
             }
             try w.endArray();
+        }
+    }.build);
+}
+
+fn writeInParts(w: *Writer, parts: []const []const u8) Error!void {
+    try w.beginString();
+    for (parts) |part| try w.writeStringPart(part);
+    try w.endString();
+}
+
+fn expectSameText(options: Options, text: []const u8, parts: []const []const u8) !void {
+    var whole_buf: [2048]u8 = undefined;
+    var whole: std.Io.Writer = .fixed(&whole_buf);
+    var at_once: Writer = .init(&whole, options);
+    try at_once.writeString(text);
+    var parts_buf: [2048]u8 = undefined;
+    var in_parts: std.Io.Writer = .fixed(&parts_buf);
+    var piecewise: Writer = .init(&in_parts, options);
+    try writeInParts(&piecewise, parts);
+    try testing.expectEqualStrings(whole.buffered(), in_parts.buffered());
+}
+
+fn expectSameCbor(text: []const u8, parts: []const []const u8) !void {
+    var whole_buf: [1024]u8 = undefined;
+    var whole: std.Io.Writer = .fixed(&whole_buf);
+    var at_once: Writer = .init(&whole, .{ .format = .cbor });
+    try at_once.writeString(text);
+    var parts_buf: [1024]u8 = undefined;
+    var in_parts: std.Io.Writer = .fixed(&parts_buf);
+    var piecewise: Writer = .init(&in_parts, .{ .format = .cbor });
+    try writeInParts(&piecewise, parts);
+
+    var expected: Reader = .init(testing.allocator, whole.buffered(), .{});
+    defer expected.deinit();
+    var actual: Reader = .init(testing.allocator, in_parts.buffered(), .{});
+    defer actual.deinit();
+    try testing.expectEqualStrings((try expected.next()).?.string, (try actual.next()).?.string);
+    try testing.expectEqual(null, try actual.next());
+}
+
+fn expectSameTree(text: []const u8, parts: []const []const u8) !void {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var builder: Builder = .{ .arena = &arena };
+    defer builder.deinit();
+    var writer: Writer = .initTree(&builder);
+    try writeInParts(&writer, parts);
+    try testing.expectEqualStrings(text, builder.root.?.string);
+}
+
+test "a string written in parts is the string written whole, wherever it is cut" {
+    const pieces = [_][]const u8{ "a", " ", "é", "中", "😀", "\"", "\\", "\n", "\x01", "\xff", "\xe4", "\xed\xa0\x80", "\xf0\x9f" };
+    var prng: std.Random.DefaultPrng = .init(0x5eed_0f_9a47);
+    const random = prng.random();
+    var text_buf: [256]u8 = undefined;
+    var cuts: [12]usize = undefined;
+    var parts: [cuts.len + 1][]const u8 = undefined;
+    for (0..2000) |_| {
+        var len: usize = 0;
+        for (0..random.uintLessThan(usize, 48)) |_| {
+            const piece = pieces[random.uintLessThan(usize, pieces.len)];
+            if (len + piece.len > text_buf.len) break;
+            @memcpy(text_buf[len..][0..piece.len], piece);
+            len += piece.len;
+        }
+        const text = text_buf[0..len];
+        const count = random.uintAtMost(usize, cuts.len);
+        for (cuts[0..count]) |*cut| cut.* = random.uintAtMost(usize, len);
+        std.mem.sort(usize, cuts[0..count], {}, std.sort.asc(usize));
+        var from: usize = 0;
+        for (cuts[0..count], 0..) |cut, i| {
+            parts[i] = text[from..cut];
+            from = cut;
+        }
+        parts[count] = text[from..];
+
+        for ([_]Options{ .{}, .{ .escape_unicode = true }, .{ .indent = 2 } }) |options| {
+            try expectSameText(options, text, parts[0 .. count + 1]);
+        }
+        try expectSameCbor(text, parts[0 .. count + 1]);
+        try expectSameTree(text, parts[0 .. count + 1]);
+    }
+}
+
+test "a string written in parts in CBOR is text of unknown length, cut between characters" {
+    try expectCbor(.{}, "d9d9f7 7f 6161 62c3a9 63e4b8ad ff", struct {
+        fn build(w: *Writer) Error!void {
+            try writeInParts(w, &.{ "", "a", "\xc3", "", "\xa9\xe4", "\xb8", "\xad" });
+        }
+    }.build);
+}
+
+test "a string written in parts takes its place among the others, in text and in a tree" {
+    const build = struct {
+        fn build(w: *Writer) Error!void {
+            try w.beginArray();
+            try writeInParts(w, &.{ "a", "b" });
+            try w.writeInt(@as(u8, 1));
+            try writeInParts(w, &.{ "e", "f" });
+            try w.beginObject();
+            try w.key("k");
+            try writeInParts(w, &.{ "c", "d" });
+            try w.field("n", 2);
+            try w.endObject();
+            try w.endArray();
+        }
+    }.build;
+    const expected = "[\"ab\",1,\"ef\",{\"k\":\"cd\",\"n\":2}]";
+    try expectWritten(.{}, expected, build);
+
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+    var builder: Builder = .{ .arena = &arena };
+    defer builder.deinit();
+    var tree: Writer = .initTree(&builder);
+    try build(&tree);
+    var buf: [64]u8 = undefined;
+    var out: std.Io.Writer = .fixed(&buf);
+    var again: Writer = .init(&out, .{});
+    try again.write(builder.root.?);
+    try testing.expectEqualStrings(expected, out.buffered());
+}
+
+test "in indented output a string written in parts opens out what it is in" {
+    try expectWritten(.{ .indent = 2 },
+        \\{
+        \\  "name": "Ada",
+        \\  "data": "aGk=",
+        \\  "pos": { "x": 1, "y": 2 },
+        \\  "list": [
+        \\    1, 2,
+        \\    "x", 3
+        \\  ]
+        \\}
+    , struct {
+        fn build(w: *Writer) Error!void {
+            try w.beginObject();
+            try w.field("name", "Ada");
+            try w.key("data");
+            try writeInParts(w, &.{ "aG", "k=" });
+            try w.field("pos", .{ .x = 1, .y = 2 });
+            try w.key("list");
+            try w.beginArray();
+            try w.writeInt(@as(u8, 1));
+            try w.writeInt(@as(u8, 2));
+            try writeInParts(w, &.{"x"});
+            try w.writeInt(@as(u8, 3));
+            try w.endArray();
+            try w.endObject();
+        }
+    }.build);
+    try expectWritten(.{ .indent = 2 },
+        \\{
+        \\  "a": {
+        \\    "b": "xy"
+        \\  }
+        \\}
+    , struct {
+        fn build(w: *Writer) Error!void {
+            try w.beginObject();
+            try w.key("a");
+            try w.beginObject();
+            try w.key("b");
+            try writeInParts(w, &.{ "x", "y" });
+            try w.endObject();
+            try w.endObject();
+        }
+    }.build);
+    try expectWritten(.{ .indent = 2, .line_width = 24 },
+        \\{
+        \\  "outer": {
+        \\    "inner": {
+        \\      "data": "0123456789abcdef"
+        \\    }
+        \\  },
+        \\  "list": [
+        \\    1,
+        \\    "0123456789abcde",
+        \\    2
+        \\  ]
+        \\}
+    , struct {
+        fn build(w: *Writer) Error!void {
+            try w.beginObject();
+            try w.key("outer");
+            try w.beginObject();
+            try w.key("inner");
+            try w.beginObject();
+            try w.key("data");
+            try writeInParts(w, &.{ "01234567", "89abcdef" });
+            try w.endObject();
+            try w.endObject();
+            try w.key("list");
+            try w.beginArray();
+            try w.writeInt(@as(u8, 1));
+            try writeInParts(w, &.{ "0123456789", "abcde" });
+            try w.writeInt(@as(u8, 2));
+            try w.endArray();
+            try w.endObject();
         }
     }.build);
 }

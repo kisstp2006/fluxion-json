@@ -426,6 +426,14 @@ token without taking it, and `skipValue` passes over a whole value however
 deep. The writer checks, in debug builds, that it is given well-formed JSON:
 a value without a key inside an object is an assertion, not a broken file.
 
+A string too long to hold whole - the base64 of a picture going into a
+request, say - is written a part at a time: `beginString`, `writeStringPart`
+for as long as there is more, then `endString`. A part may end in the middle
+of a character; the next part brings the rest. In CBOR it becomes text of
+unknown length, which the reader here takes like any other; in indented
+output its length is not known in advance, so the object or array around it
+gets a line for each member.
+
 ## Speed
 
 Timed against `std.json` with `zig build bench` (ReleaseFast, Windows,

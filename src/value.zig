@@ -521,6 +521,8 @@ pub const Builder = struct {
     values: std.ArrayListUnmanaged(Value) = .empty,
     names: std.ArrayListUnmanaged([]const u8) = .empty,
     frames: std.ArrayListUnmanaged(Frame) = .empty,
+    /// A string arriving in parts, gathered until it ends.
+    parts: std.ArrayListUnmanaged(u8) = .empty,
     root: ?Value = null,
 
     const Frame = struct {
@@ -535,6 +537,7 @@ pub const Builder = struct {
         b.values.deinit(gpa);
         b.names.deinit(gpa);
         b.frames.deinit(gpa);
+        b.parts.deinit(gpa);
     }
 
     pub fn begin(b: *Builder, is_object: bool, start: usize) Allocator.Error!void {
@@ -552,6 +555,15 @@ pub const Builder = struct {
 
     pub fn string(b: *Builder, text: []const u8) Allocator.Error!void {
         try b.add(.{ .string = try b.arena.allocator().dupe(u8, text) });
+    }
+
+    pub fn stringPart(b: *Builder, part: []const u8) Allocator.Error!void {
+        try b.parts.appendSlice(b.arena.child_allocator, part);
+    }
+
+    pub fn endString(b: *Builder) Allocator.Error!void {
+        defer b.parts.clearRetainingCapacity();
+        try b.string(b.parts.items);
     }
 
     /// Add a value that owns no memory, or whose memory is already in the arena.
