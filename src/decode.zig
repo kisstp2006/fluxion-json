@@ -337,21 +337,27 @@ const Context = struct {
                 try c.reader.skipValue();
                 continue;
             };
-            inline for (fields, 0..) |f, i| if (i == index) {
-                const name = comptime reflect.jsonName(T, f.name);
-                const keep_first = seen[i] and switch (c.options.duplicate_keys) {
-                    .last => false,
-                    .first => true,
-                    .fail => return c.fail(error.DuplicateKey, path, "the field \"{s}\" is given twice", .{name}),
-                };
-                if (keep_first) {
-                    try c.reader.skipValue();
-                } else {
-                    const step: Path = .{ .parent = path, .step = .{ .key = name } };
-                    @field(result, f.name) = try c.decode(f.type, &step);
-                    seen[i] = true;
+            inline for (fields, 0..) |f, i| {
+                // What `fieldNames` leaves out is never read, so it is never
+                // compiled as something to read either: a field in
+                // `json_ignore` may be of a type JSON has no word for.
+                if (comptime f.is_comptime or f.type == void or reflect.isIgnored(T, f.name)) continue;
+                if (i == index) {
+                    const name = comptime reflect.jsonName(T, f.name);
+                    const keep_first = seen[i] and switch (c.options.duplicate_keys) {
+                        .last => false,
+                        .first => true,
+                        .fail => return c.fail(error.DuplicateKey, path, "the field \"{s}\" is given twice", .{name}),
+                    };
+                    if (keep_first) {
+                        try c.reader.skipValue();
+                    } else {
+                        const step: Path = .{ .parent = path, .step = .{ .key = name } };
+                        @field(result, f.name) = try c.decode(f.type, &step);
+                        seen[i] = true;
+                    }
                 }
-            };
+            }
         }
         inline for (fields, 0..) |f, i| {
             if (!seen[i] and !f.is_comptime) {
@@ -841,6 +847,21 @@ test "names follow json_case and json_rename when reading too" {
     try testing.expectEqual(@as(u32, 2), parsed.value.buffer_view);
     try testing.expectEqualStrings("VEC3", parsed.value.kind);
     try testing.expectEqual(@as(u32, 99), parsed.value.cache);
+}
+
+test "a field in json_ignore may be of a type JSON has no word for" {
+    // An allocator, say, kept beside what was read: nothing reads it, so
+    // nothing has to know how.
+    const Held = struct {
+        name: []const u8 = "",
+        gpa: ?std.mem.Allocator = null,
+
+        pub const json_ignore = .{.gpa};
+    };
+    const parsed = try expectParsed(Held, "{\"name\": \"kept\", \"gpa\": 1}", .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("kept", parsed.value.name);
+    try testing.expect(parsed.value.gpa == null);
 }
 
 test "a failed read gives back all its memory" {
